@@ -71,6 +71,7 @@ type RunStore struct {
 	db                     *DB
 	resourceReferenceStore *ResourceReferenceStore
 	time                   util.TimeInterface
+	snapshotStore          *SnapshotStore
 }
 
 // Runs two SQL queries in a transaction to return a list of matching runs, as well as their
@@ -419,6 +420,13 @@ func (s *RunStore) CreateRun(r *model.RunDetail) (*model.RunDetail, error) {
 		tx.Rollback()
 		return nil, util.NewInternalServerError(err, "Failed to store resource references to table for run %v ", r.Name)
 	}
+
+	pvcName, err := s.snapshotStore.CreatePVC(r.Name, "", r.Namespace)
+	if err != nil {
+		tx.Rollback()
+		return nil, util.NewInternalServerError(err, "Failed to create PVC %v", pvcName)
+	}
+
 	err = tx.Commit()
 	if err != nil {
 		tx.Rollback()

@@ -13,13 +13,29 @@
 # limitations under the License.
 
 import json
-import os
+import os, re
 import sys
+import string
+import random
+import copy
+import warnings
+
+from typing import (Any, Callable, Dict, List, Optional, Sequence, Tuple,
+                    TypeVar, Union)
+import kubernetes
 import ml_metadata
 from time import sleep
 from ml_metadata.proto import metadata_store_pb2
 from ml_metadata.metadata_store import metadata_store
 from ipaddress import ip_address, IPv4Address 
+import k8sutils
+import podutils
+# from kfp.dsl import PipelineVolume
+from kubernetes.client.models import (V1ObjectMeta, V1ResourceRequirements,
+                                      V1PersistentVolumeClaimSpec, V1Volume,
+                                      V1PersistentVolumeClaim, V1VolumeMount,
+                                      V1TypedLocalObjectReference)
+
 
 def value_to_mlmd_value(value) -> metadata_store_pb2.Value:
     if value is None:
@@ -425,4 +441,303 @@ def isIPv6(ip: str) -> bool:
         print('Error: Exception:{}'.format(str(e)), file=sys.stderr)
         sys.stderr.flush()
 
+##################
+##################
+#### Snapshot ####
+##################
+##################
 
+VOLUME_MODE_RWO = ["ReadWriteOnce"]
+VOLUME_MODE_RWM = ["ReadWriteMany"]
+VOLUME_MODE_ROM = ["ReadOnlyMany"]
+
+
+def snapshot_pvc(snapshot_name, pvc_name, labels, annotations):
+    """Perform a snapshot over a PVC."""
+    if annotations == {}:
+        annotations = {"access_mode": get_pvc_access_mode(pvc_name)}
+    snapshot_resource = {
+        "apiVersion": "snapshot.storage.k8s.io/v1beta1",
+        "kind": "VolumeSnapshot",
+        "metadata": {
+            "name": snapshot_name,
+            "annotations": annotations,
+            "labels": labels
+        },
+        "spec": {
+            "volumeSnapshotClassName": get_snapshotclass_name(pvc_name),
+            "source": {"persistentVolumeClaimName": pvc_name}
+        }
+    }
+    co_client = k8sutils.get_co_client()
+    namespace = podutils.get_namespace()
+    print("Taking a snapshot of PVC %s in namespace %s ...",
+             (pvc_name, namespace))
+    task_info = co_client.create_namespaced_custom_object(
+        group="snapshot.storage.k8s.io",
+        version="v1",
+        namespace=namespace,
+        plural="volumesnapshots",
+        body=snapshot_resource)
+
+    return task_info
+
+def snapshot_step():
+    """Take snapshots of the current Notebook's PVCs and store its metadata."""
+    volumes = [(path, volume.name, size)
+               for path, volume, size in podutils.list_volumes()]
+    namespace = podutils.get_namespace()
+    pod_name = podutils.get_pod_name()
+    resources = get_step_resources()
+    print("Taking a snapshot of notebook %s in namespace %s ...",
+             (pod_name, namespace))
+    version_uuid = generate_uuid()
+    snapshot_names = []
+    for vol in volumes:
+        annotations = {}
+        if resources:
+            for key in resources:
+                annotations[key] = resources[key]
+        annotations["access_mode"] = get_pvc_access_mode(vol[1])
+        annotations["container_image"] = podutils.get_docker_base_image()
+        annotations["volume_path"] = vol[0]
+        snapshot_name = "nb-snapshot-" + version_uuid + "-" + vol[1]
+        snapshot_pvc(
+            snapshot_name=snapshot_name,
+            pvc_name=vol[1],
+            annotations=annotations,
+            labels={"container_name": podutils.get_container_name(),
+                    "version_uuid": version_uuid,
+                    "is_workspace_dir": str(podutils.is_workspace_dir(vol[0]))}
+        )
+        snapshot_names.append(snapshot_name)
+    return snapshot_names
+
+
+def get_step_resources():
+    """Get the resource limits and requests of the current Notebook."""
+    nb_name = podutils.get_container_name()
+    namespace = podutils.get_namespace()
+    co_client = k8sutils.get_co_client()
+    get_resource = co_client.get_namespaced_custom_object(
+        name=nb_name,
+        group="argoproj.io",
+        version="v1alpha1",
+        namespace=namespace,
+        plural="Workflow")["spec"]["template"]["container"][0]
+    resource_spec = get_resource["resources"]
+    resource_conf = {}
+    for resource_type in resource_spec.items():
+        for key in resource_type[1]:
+            resource_conf[resource_type[0] + "_" + key] = resource_type[1][key]
+    return resource_conf
+
+
+def get_snapshotclass_name(pvc_name, label_selector=""):
+    """Get the Volume Snapshot Class Name for a PVC."""
+    client = k8sutils.get_v1_client()
+    namespace = podutils.get_namespace()
+    pvc = client.read_namespaced_persistent_volume_claim(pvc_name, namespace)
+    ann = pvc.metadata.annotations
+    provisioner = ann.get("volume.beta.kubernetes.io/storage-provisioner",
+                          None)
+    snapshotclasses = podutils.get_snapshotclasses(label_selector)
+    return [snapclass_name["metadata"]["name"] for snapclass_name in
+            snapshotclasses if snapclass_name["driver"] == provisioner][0]
+
+def get_pvc_access_mode(pvc_name):
+    """Get the access mode of a PVC."""
+    client = k8sutils.get_v1_client()
+    namespace = podutils.get_namespace()
+    pvc = client.read_namespaced_persistent_volume_claim(pvc_name, namespace)
+    return pvc.spec.access_modes[0]
+
+def generate_uuid():
+    """Generate a 8 character UUID for snapshot names and versioning."""
+    alphabet = string.ascii_lowercase + string.digits
+    return ''.join(random.choices(alphabet, k=8))
+
+def create_pvc(wf_name):
+    client = k8sutils.get_v1_client()
+    namespace = podutils.get_namespace()
+
+    pvc_metadata = V1ObjectMeta(
+        name=wf_name + "pvc" + generate_uuid()
+    )
+    requested_resources = V1ResourceRequirements(requests={"storage": "1Gi"})
+    pvc_spec = V1PersistentVolumeClaimSpec(
+        access_modes=VOLUME_MODE_RWM,
+        resources=requested_resources,
+        storage_class_name="longhorn")
+    k8s_resource = V1PersistentVolumeClaim(
+        api_version="v1",
+        kind="PersistentVolumeClaim",
+        metadata=pvc_metadata,
+        spec=pvc_spec)
+    ns_pvc = client.create_namespaced_persistent_volume_claim(namespace, k8s_resource)
+    return ns_pvc
+
+def mount_pvc_to_pipeline(pvolumes: Dict[str, V1Volume]):
+    client=k8sutils.get_v1_client()
+    namespace = podutils.get_namespace()
+    for mountpath, pvolume in pvolumes.items():
+        volume_mount = V1VolumeMount(name=pvolume.name, mount_path=mountpath)
+    return client.patch_namespaced_persistent_volume_claim(pvolume.name, namespace=namespace, body={"status":{"mounts":[volume_mount]}})
+
+def patch_pvc_storage(pvc_name, size):
+    client=k8sutils.get_v1_client
+    namespace=podutils.get_namespace()
+    pvc = client.read_namespaced_persistent_volume_claim(pvc_name, namespace=namespace)
+
+    # Update the PVC to request more storage
+    pvc.spec.resources.requests["storage"] = size
+    new_pvc=client.patch_namespaced_persistent_volume_claim(pvc_name, namespace, pvc)
+    return new_pvc
+
+def rewrite_data_passing(workflow: dict, volume: dict, path_prefix: str = 'artifact_data/') -> dict:
+    workflow = copy.deepcopy(workflow)
+    templates = workflow['spec']['templates']
+
+    container_templates = [template for template in templates if 'container' in template]
+    dag_templates = [template for template in templates if 'dag' in template]
+    steps_templates = [template for template in templates if 'steps' in template]
+
+    execution_data_dir = path_prefix + '{{workflow.uid}}_{{pod.name}}/'
+
+    data_volume_name = 'data-storage'
+    volume['name'] = data_volume_name
+
+    subpath_parameter_name_suffix = '-subpath'
+
+    def convert_artifact_reference_to_parameter_reference(reference: str) -> str:
+        parameter_reference = re.sub(
+            r'{{([^}]+)\.artifacts\.([^}]+)}}',
+            r'{{\1.parameters.\2' + subpath_parameter_name_suffix + '}}', # re.escape(subpath_parameter_name_suffix) escapes too much.
+            reference,
+        )
+        return parameter_reference
+
+    # Adding the data storage volume to the workflow
+    workflow['spec'].setdefault('volumes', []).append(volume)
+
+    all_artifact_file_names = set() # All artifacts should have same file name (usually, "data"). This variable holds all different artifact names for verification.
+
+    # Rewriting container templates
+    for template in templates:
+        if 'container' not in template and 'script' not in template:
+            continue
+        container_spec = template['container'] or template['steps']
+        # Inputs
+        input_artifacts = template.get('inputs', {}).get('artifacts', [])
+        if input_artifacts:
+            input_parameters = template.setdefault('inputs', {}).setdefault('parameters', [])
+            volume_mounts = container_spec.setdefault('volumeMounts', [])
+            for input_artifact in input_artifacts:
+                subpath_parameter_name = input_artifact['name'] + subpath_parameter_name_suffix # TODO: Maybe handle clashing names.
+                artifact_file_name = os.path.basename(input_artifact['path'])
+                all_artifact_file_names.add(artifact_file_name)
+                artifact_dir = os.path.dirname(input_artifact['path'])
+                volume_mounts.append({
+                    'mountPath': artifact_dir,
+                    'name': data_volume_name,
+                    'subPath': '{{inputs.parameters.' + subpath_parameter_name + '}}',
+                    'readOnly': True,
+                })
+                input_parameters.append({
+                    'name': subpath_parameter_name,
+                })
+        # template.get('inputs', {}).pop('artifacts', None)
+
+        # Outputs
+        output_artifacts = template.get('outputs', {}).get('artifacts', [])
+        if output_artifacts:
+            output_parameters = template.setdefault('outputs', {}).setdefault('parameters', [])
+            del template.get('outputs', {})['artifacts']
+            volume_mounts = container_spec.setdefault('volumeMounts', [])
+            for output_artifact in output_artifacts:
+                output_name = output_artifact['name']
+                subpath_parameter_name = output_name + subpath_parameter_name_suffix # TODO: Maybe handle clashing names.
+                artifact_file_name = os.path.basename(output_artifact['path'])
+                all_artifact_file_names.add(artifact_file_name)
+                artifact_dir = os.path.dirname(output_artifact['path'])
+                output_subpath = execution_data_dir + output_name
+                volume_mounts.append({
+                    'mountPath': artifact_dir,
+                    'name': data_volume_name,
+                    'subPath': output_subpath, # TODO: Switch to subPathExpr when it's out of beta: https://kubernetes.io/docs/concepts/storage/volumes/#using-subpath-with-expanded-environment-variables
+                })
+                output_parameters.append({
+                    'name': subpath_parameter_name,
+                    'value': output_subpath, # Requires Argo 2.3.0+
+                })
+            # template.get('outputs', {}).pop('artifacts', None)
+
+    # Rewrite DAG templates
+    for template in templates:
+        if 'dag' not in template and 'steps' not in template:
+            continue
+
+        # Inputs
+        input_artifacts = template.get('inputs', {}).get('artifacts', [])
+        if input_artifacts:
+            input_parameters = template.setdefault('inputs', {}).setdefault('parameters', [])
+            volume_mounts = container_spec.setdefault('volumeMounts', [])
+            for input_artifact in input_artifacts:
+                subpath_parameter_name = input_artifact['name'] + subpath_parameter_name_suffix # TODO: Maybe handle clashing names.
+                input_parameters.append({
+                    'name': subpath_parameter_name,
+                })
+        # template.get('inputs', {}).pop('artifacts', None)
+
+        # Outputs
+        output_artifacts = template.get('outputs', {}).get('artifacts', [])
+        if output_artifacts:
+            output_parameters = template.setdefault('outputs', {}).setdefault('parameters', [])
+            volume_mounts = container_spec.setdefault('volumeMounts', [])
+            for output_artifact in output_artifacts:
+                output_name = output_artifact['name']
+                subpath_parameter_name = output_name + subpath_parameter_name_suffix # TODO: Maybe handle clashing names.
+                output_parameters.append({
+                    'name': subpath_parameter_name,
+                    'valueFrom': {
+                        'parameter': convert_artifact_reference_to_parameter_reference(output_artifact['from'])
+                    },
+                })
+        # template.get('outputs', {}).pop('artifacts', None)
+        
+        # Arguments
+        for task in template.get('dag', {}).get('tasks', []) + [steps for group in template.get('steps', []) for steps in group]:
+            argument_artifacts = task.get('arguments', {}).get('artifacts', [])
+            if argument_artifacts:
+                argument_parameters = task.setdefault('arguments', {}).setdefault('parameters', [])
+                for argument_artifact in argument_artifacts:
+                    if 'from' not in argument_artifact:
+                        raise NotImplementedError('Volume-based data passing rewriter does not support constant artifact arguments at this moment. Only references can be passed.')
+                    subpath_parameter_name = argument_artifact['name'] + subpath_parameter_name_suffix # TODO: Maybe handle clashing names.
+                    argument_parameters.append({
+                        'name': subpath_parameter_name,
+                        'value': convert_artifact_reference_to_parameter_reference(argument_artifact['from']),
+                    })
+            # task.get('arguments', {}).pop('artifacts', None)
+
+        # There should not be any artifact references in any other part of DAG template (only parameter references)
+
+    # Check that all artifacts have the same file names
+    if len(all_artifact_file_names) > 1:
+        warnings.warn('Detected different artifact file names: [{}]. The workflow can fail at runtime. Please use the same file name (e.g. "data") for all artifacts.'.format(', '.join(all_artifact_file_names)))
+
+    # Fail if workflow has argument artifacts
+    workflow_argument_artifacts = workflow['spec'].get('arguments', {}).get('artifacts', [])
+    if workflow_argument_artifacts:
+        raise NotImplementedError('Volume-based data passing rewriter does not support constant artifact arguments at this moment. Only references can be passed.')
+
+    return workflow
+
+def transform_workflow(workflow: dict, volume:dict, path_prefix: str = 'artifact_data/') -> dict:
+    if isinstance(volume, dict):
+        volume_dict = volume
+    else:
+        volume_dict = kubernetes.kubernetes.client.ApiClient(
+        ).sanitize_for_serialization(volume)
+    return rewrite_data_passing(workflow, volume_dict,
+                                                   path_prefix)

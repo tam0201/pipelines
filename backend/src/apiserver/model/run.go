@@ -37,6 +37,7 @@ type Run struct {
 	Conditions         string `gorm:"column:Conditions; not null"`
 	Metrics            []*RunMetric
 	ResourceReferences []*ResourceReference
+	Snapshot           []*Snapshot
 	PipelineSpec
 }
 

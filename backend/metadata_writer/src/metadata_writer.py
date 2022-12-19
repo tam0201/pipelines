@@ -199,7 +199,7 @@ while True:
                 if env.name == ARGO_TEMPLATE_ENV_KEY:
                     argo_template = json.loads(env.value)
                     break
-
+            pvc=create_pvc(argo_workflow_name) 
             # Should we throw error instead if argo template not found?
             argo_template_name = argo_template.get('name', '')
 
@@ -265,7 +265,8 @@ while True:
                         input_name = input_name[len(input_artifact_path_prefix):]
                     if input_name.endswith(input_artifact_path_postfix):
                         input_name = input_name[0: -len(input_artifact_path_postfix)]
-
+                    # mount pvc    
+                    pvc = mount_pvc_to_pipeline(pvolumes={input_artifact_path_prefix: pvc})
                     artifact = link_execution_to_input_artifact(
                         store=mlmd_store,
                         execution_id=execution.id,

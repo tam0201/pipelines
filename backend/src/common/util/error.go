@@ -169,6 +169,14 @@ func NewResourcesNotFoundError(resourceTypesFormat string, resourceNames ...inte
 		codes.NotFound)
 }
 
+func NewSnapshotNotFoundError(snapshotClass string, snapshotName string) *UserError {
+	externalMessage := fmt.Sprintf("%s %s not found.", snapshotClass, snapshotName)
+	return newUserError(
+		errors.New(fmt.Sprintf("SnapshotNotFoundError: %v", externalMessage)),
+		externalMessage,
+		codes.NotFound)
+}
+
 func NewInvalidInputError(messageFormat string, a ...interface{}) *UserError {
 	message := fmt.Sprintf(messageFormat, a...)
 	return newUserError(errors.Errorf("Invalid input error: %v", message), message, codes.InvalidArgument)
