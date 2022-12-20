@@ -22,6 +22,7 @@ import yaml
 from time import sleep
 import lru
 
+from workflow import *
 from metadata_helpers import *
 
 
@@ -35,7 +36,7 @@ debug_files_size = os.environ.get('DEBUG_FILES_SIZE', 5000)
 kubernetes.config.load_incluster_config()
 k8s_api = kubernetes.client.CoreV1Api()
 k8s_watch = kubernetes.watch.Watch()
-
+customObject = kubernetes.client.CustomObjectsApi()
 
 patch_retries = 20
 sleep_time = 0.1
@@ -63,7 +64,33 @@ def patch_pod_metadata(
             print(e)
             sleep(sleep_time)
 
-
+def patch_wf_template(
+    namespace: str,
+    wf_name: str,
+    patch: dict,
+    k8s_api: kubernetes.client.CustomObjectsApi = None,
+):
+    k8s_api = k8s_api or kubernetes.client.CustomObjectsApi()
+    patch = {
+        'spec': {
+            'templates': [patch]
+        }
+    }
+    for retry in range(patch_retries):
+        try:
+            wf = k8s_api.patch_namespaced_custom_object(
+                group='argoproj.io',
+                version='v1alpha1',
+                plural='workflows',
+                name=wf_name,
+                namespace=namespace,
+                body=patch,
+            )
+            return wf
+        except Exception as e:
+            print(e)
+            sleep(sleep_time)
+    
 #Connecting to MetadataDB
 mlmd_store = connect_to_mlmd()
 print("Connected to the metadata store")
@@ -168,7 +195,31 @@ while True:
                 print(event)
 
             pod_name = obj.metadata.name
+            pod_namespace = obj.metadata.namespace
+            argo_workflow_name = obj.metadata.labels[ARGO_WORKFLOW_LABEL_KEY] # Should exist due to initial filtering
 
+            # Get the workflow
+            workflow = customObject.get_namespaced_custom_object(
+            group='argoproj.io',
+            version='v1alpha1',
+            namespace=pod_namespace,
+            plural='workflows',
+            name=argo_workflow_name,
+            )
+            
+            # Create PVC
+            
+            if not is_pvc_exist(argo_workflow_name+"pvc", pod_namespace):
+                print("Creating PVC")
+                pvc = create_pvc(argo_workflow_name, pod_namespace) 
+                # Attach PVC to workflow
+                workflow_templates = transform_workflow(workflow.items, pvc)
+                patch_wf_template(
+                    namespace=pod_namespace,
+                    wf_name = argo_workflow_name,
+                    patch=workflow_templates
+                )
+            
             # Logging pod changes for debugging
             debug_path = '/tmp/pod_' + obj.metadata.name + '_' + obj.metadata.resource_version
             with open(debug_path, 'w') as f:
@@ -192,17 +243,17 @@ while True:
             # Skip KFP v2 pods - they have their own metadat writers
             if is_kfp_v2_pod(obj):
                 continue
-
-            argo_workflow_name = obj.metadata.labels[ARGO_WORKFLOW_LABEL_KEY] # Should exist due to initial filtering
+            
+            # Resume artifacts process
             argo_template = {}
             for env in obj.spec.containers[0].env:
                 if env.name == ARGO_TEMPLATE_ENV_KEY:
                     argo_template = json.loads(env.value)
                     break
-            pvc=create_pvc(argo_workflow_name) 
+            
             # Should we throw error instead if argo template not found?
             argo_template_name = argo_template.get('name', '')
-
+            
             component_name = argo_template_name
             component_version = component_name
             argo_output_name_to_type = {}
@@ -265,8 +316,7 @@ while True:
                         input_name = input_name[len(input_artifact_path_prefix):]
                     if input_name.endswith(input_artifact_path_postfix):
                         input_name = input_name[0: -len(input_artifact_path_postfix)]
-                    # mount pvc    
-                    pvc = mount_pvc_to_pipeline(pvolumes={input_artifact_path_prefix: pvc})
+   
                     artifact = link_execution_to_input_artifact(
                         store=mlmd_store,
                         execution_id=execution.id,

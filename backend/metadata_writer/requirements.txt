@@ -27,6 +27,6 @@ rsa==4.8                  # via google-auth
 six==1.16.0               # via absl-py, google-auth, grpcio, kubernetes, ml-metadata, python-dateutil
 urllib3==1.26.8           # via kubernetes, requests
 websocket-client==1.2.3   # via kubernetes
-
+tabulate
 # The following packages are considered to be unsafe in a requirements file:
 # setuptools
